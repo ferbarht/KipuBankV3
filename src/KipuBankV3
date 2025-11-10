@@ -12,7 +12,7 @@ import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
 /// @author Fernando
 /// @notice Deposit and withdraw ETH or ERC-20 tokens into personal vaults, with admin roles and USD cap
 /// @dev Uses AccessControl, supports multiple tokens, integrates Chainlink oracle, optimizes gas via decimal cache
-contract KipuBankV2 is AccessControl {
+contract KipuBankV3 is AccessControl {
    /*//////////////////////////////////////////////////////////////
                                  ROLES
 //////////////////////////////////////////////////////////////*/
