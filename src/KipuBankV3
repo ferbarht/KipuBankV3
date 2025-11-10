@@ -1,0 +1,489 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
+import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
+
+/// @title KipuBankV2 - Personal multi-token vault with access control and USD cap via Chainlink
+/// @author Fernando
+/// @notice Deposit and withdraw ETH or ERC-20 tokens into personal vaults, with admin roles and USD cap
+/// @dev Uses AccessControl, supports multiple tokens, integrates Chainlink oracle, optimizes gas via decimal cache
+contract KipuBankV2 is AccessControl {
+   /*//////////////////////////////////////////////////////////////
+                                 ROLES
+//////////////////////////////////////////////////////////////*/
+
+/// @notice Administrative role for sensitive functions
+bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
+
+/*//////////////////////////////////////////////////////////////
+                         CONSTANTS AND TYPES
+//////////////////////////////////////////////////////////////*/
+
+/// @notice Address used to represent ETH as the native token
+address public constant NATIVE_TOKEN = address(0);
+
+/// @notice Chainlink ETH/USD oracle address on Sepolia
+address public constant PRICE_FEED_ADDRESS = 0x694AA1769357215DE4FAC081bf1f309aDC325306;
+
+address public constant USDC = 0x7Fc21ceb0C5003576ab5E101eB240c2b822c95d2; // USDC address on Sepolia
+IUniswapV2Router02 public immutable uniswapRouter;
+IUniswapV2Factory public immutable uniswapFactory;
+
+/*//////////////////////////////////////////////////////////////
+                                 STATE
+//////////////////////////////////////////////////////////////*/
+
+/// @notice Maximum withdrawal limit per transaction (in wei)
+/// @dev Immutable, set in the constructor
+uint256 public immutable withdrawalLimit;
+
+/// @notice Global cumulative deposit cap in USD (6 decimals)
+/// @dev Immutable, set in the constructor
+uint256 public immutable bankCapUSD;
+
+/// @notice Chainlink ETH/USD oracle instance
+AggregatorV3Interface public immutable priceFeed;
+
+/// @dev Simple mutex for reentrancy protection
+uint256 private _locked;
+
+/// @notice Total ETH deposited (in wei)
+uint256 public totalDeposited;
+
+/// @notice ETH balance per user
+mapping(address => uint256) private vaults;
+
+/// @notice ETH deposit count per user
+mapping(address => uint256) public depositCount;
+
+/// @notice ETH withdrawal count per user
+mapping(address => uint256) public withdrawalCount;
+
+/// @notice ERC-20 token balance per user
+mapping(address => mapping(address => uint256)) private vaultsByToken;
+
+/// @notice ERC-20 token deposit count per user
+mapping(address => mapping(address => uint256)) public depositCountByToken;
+
+/// @notice ERC-20 token withdrawal count per user
+mapping(address => mapping(address => uint256)) public withdrawalCountByToken;
+
+/// @notice Total deposited per token
+mapping(address => uint256) public totalDepositedByToken;
+
+/// @notice Token decimal cache to optimize gas usage
+mapping(address => uint8) public tokenDecimalsCache;
+
+    /*//////////////////////////////////////////////////////////////
+                                 Events
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Emitted when ETH is deposited
+    /// @param user Depositor address
+    /// @param amount Amount deposited in wei
+    /// @dev Emitted after vault state is updated
+    event Deposited(address indexed user, uint256 amount);
+
+    /// @notice Emitted when ETH is withdrawn
+    /// @param user Withdrawer address
+    /// @param amount Amount withdrawn in wei
+    event Withdrawn(address indexed user, uint256 amount);
+
+    /// @notice Emitted when ERC-20 token is deposited
+    /// @param user Depositor address
+    /// @param token Token address
+    /// @param amount Amount deposited
+    /// @dev Emitted after token is transferred and credited
+    event TokenDeposited(address indexed user, address indexed token, uint256 amount);
+
+    /// @notice Emitted when ERC-20 token is withdrawn
+    /// @param user Withdrawer address
+    /// @param token Token address
+    /// @param amount Amount withdrawn
+    event TokenWithdrawn(address indexed user, address indexed token, uint256 amount);
+
+    /*//////////////////////////////////////////////////////////////
+                                 ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Thrown when the deposit exceeds the global USD cap
+    error BankCapExceeded(uint256 attemptedUSD); 
+
+    /// @notice Thrown when the withdrawal exceeds the per-transaction limit
+    error WithdrawalLimitExceeded(uint256 requested);
+
+    /// @notice Thrown when the user has insufficient vault balance
+    error InsufficientVaultBalance(uint256 requested, uint256 available);
+
+    /// @notice Thrown when native ETH transfer fails
+    error NativeTransferFailed(address to, uint256 amount);
+
+    /// @notice Thrown when attempting to deposit zero amount
+    error ZeroDeposit();
+
+    /// @notice Thrown when a reentrancy attempt is detected
+    error Reentrancy();
+
+    /// @notice Thrown when trying to deposit ETH via depositToken
+    error UseNativeDeposit();
+
+   /// @notice Thrown when the token has unsupported decimals
+    error UnsupportedDecimals();
+
+    /// @notice Thrown when the oracle returns an invalid price
+    error InvalidPrice();
+
+    /// @notice Thrown when no direct USDC trading pair exists on Uniswap
+    error NoUSDCTradingPair(address token);
+
+    /*//////////////////////////////////////////////////////////////
+                                MODIFIERS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Ensures ETH deposit is non-zero
+    /// @dev Requires msg.value > 0, otherwise reverts with ZeroDeposit
+    modifier nonZeroDeposit() {
+        if (msg.value == 0) revert ZeroDeposit();
+        _;
+    }
+
+    /// @notice Prevents reentrancy using simple mutex
+    /// @dev Requires _locked == 0, locks during execution
+    modifier nonReentrant() {
+        if (_locked == 1) revert Reentrancy();
+        _locked = 1;
+        _;
+        _locked = 0;
+    }
+
+    /// @notice Ensures withdrawal amount does not exceed limit
+    /// @param amount Requested withdrawal amount in wei
+    /// @dev Compares against withdrawalLimit and reverts if exceeded
+    modifier validWithdrawal(uint256 amount) {
+        if (amount > withdrawalLimit) revert WithdrawalLimitExceeded(amount);
+        _;
+    }
+
+    /// @notice Ensures user has sufficient ETH balance
+    /// @param amount Requested withdrawal amount in wei
+    /// @dev Compares against vaults[msg.sender] and reverts if insufficient
+    modifier hasSufficientBalance(uint256 amount) {
+        uint256 balance = vaults[msg.sender];
+        if (amount > balance) revert InsufficientVaultBalance(amount, balance);
+        _;
+    }
+
+    /// @notice Ensures ETH deposit does not exceed global USD cap
+    /// @param amountWei Amount to deposit in wei
+    /// @dev Converts to USD using Chainlink and compares against bankCapUSD
+    modifier validDepositCapUSD(uint256 amountWei) {
+        uint256 newTotalWei = totalDeposited + amountWei;
+        uint256 newTotalUSD = convertETHtoUSD(newTotalWei);
+        if (newTotalUSD > bankCapUSD) revert BankCapExceeded(newTotalUSD);
+        _;
+    }
+
+    /// @notice Ensures ERC-20 token deposit does not exceed global USD cap
+    /// @param token ERC-20 token address
+    /// @param amount Amount to deposit in token units
+    /// @dev Converts to USD and compares against bankCapUSD
+    modifier validTokenDepositCapUSD(address token, uint256 amount) {
+        uint256 newTotal = totalDepositedByToken[token] + amount;
+        uint256 newTotalUSD = convertTokenToUSD(token, newTotal);
+        if (newTotalUSD > bankCapUSD) revert BankCapExceeded(newTotalUSD);
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+     /// @notice Initializes the contract with withdrawal limits and USD cap
+    /// @param _withdrawalLimit Maximum withdrawal per transaction in wei
+    /// @param _bankCapUSD Global deposit cap in USD (6 decimals)
+    /// @param _uniswapRouter Address of Uniswap V2 router
+    /// @param _uniswapFactory Address of Uniswap V2 factory
+    /// @dev Assigns roles, sets limits, and allows optional initial deposit
+    constructor(
+        uint256 _withdrawalLimit,
+        uint256 _bankCapUSD,
+        address _uniswapRouter,
+        address _uniswapFactory //MIRAR
+        ///address _priceFeed
+    ) payable {
+        withdrawalLimit = _withdrawalLimit;
+        bankCapUSD = _bankCapUSD;
+        priceFeed = AggregatorV3Interface(PRICE_FEED_ADDRESS);
+        uniswapRouter = IUniswapV2Router02(_uniswapRouter);
+        uniswapFactory = IUniswapV2Factory(_uniswapFactory);
+        _locked = 0;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(MANAGER_ROLE, msg.sender);
+
+        if (msg.value > 0) {
+            _handleDeposit(msg.sender, msg.value);
+        }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             External Functions
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Deposit ETH into sender's personal vault
+    /// @dev Validates non-zero amount and global USD cap
+    function deposit()
+        external
+        payable
+        nonZeroDeposit
+        nonReentrant
+        validDepositCapUSD(msg.value)
+    {
+        _handleDeposit(msg.sender, msg.value);
+    }
+
+    /// @notice Withdraw ETH from sender's personal vault
+    /// @param amount Amount to withdraw in wei
+    /// @dev Validates per-transaction limit, sufficient balance, and prevents reentrancy
+    function withdraw(uint256 amount)
+        external
+        nonReentrant
+        validWithdrawal(amount)
+        hasSufficientBalance(amount)
+    {
+        unchecked {
+            vaults[msg.sender] -= amount;
+            totalDeposited -= amount;
+        }
+        withdrawalCount[msg.sender] += 1;
+        _safeTransfer(msg.sender, amount);
+        emit Withdrawn(msg.sender, amount);
+    }
+
+    /// @notice Deposit ERC-20 tokens into personal vault
+    /// @param token ERC-20 token address
+    /// @param amount Amount to deposit
+    /// @dev Validates non-ETH token, non-zero amount, and global USD cap
+    function depositToken(address token, uint256 amount)
+        external
+        nonReentrant
+        validTokenDepositCapUSD(token, amount)
+    {
+        if (token == NATIVE_TOKEN) revert UseNativeDeposit();
+        if (amount == 0) revert ZeroDeposit();
+
+        IERC20(token).transferFrom(msg.sender, address(this), amount);
+
+        unchecked {
+            vaultsByToken[msg.sender][token] += amount;
+            totalDepositedByToken[token] += amount;
+        }
+        depositCountByToken[msg.sender][token] += 1;
+        emit TokenDeposited(msg.sender, token, amount);
+    }
+
+    /// @notice Withdraw ERC-20 tokens from personal vault
+    /// @param token ERC-20 token address
+    /// @param amount Amount to withdraw
+    /// @dev Validates sufficient balance and prevents reentrancy
+    function withdrawToken(address token, uint256 amount)
+        external
+        nonReentrant
+    {
+        uint256 balance = vaultsByToken[msg.sender][token];
+        if (amount > balance) revert InsufficientVaultBalance(amount, balance);
+
+        unchecked {
+            vaultsByToken[msg.sender][token] -= amount;
+            totalDepositedByToken[token] -= amount;
+        }
+        withdrawalCountByToken[msg.sender][token] += 1;
+        IERC20(token).transfer(msg.sender, amount);
+        emit TokenWithdrawn(msg.sender, token, amount);
+    }
+
+
+/// @notice Deposit any ERC-20 token, converting to USDC if needed
+/// @param token Token address to deposit
+/// @param amount Amount of token to deposit
+/// @dev If not USDC, swaps via Uniswap V2 and credits USDC
+function depositAnyToken(address token, uint256 amount)
+    external
+    nonReentrant
+{
+    if (amount == 0) revert ZeroDeposit();
+
+    if (token == USDC) {
+        IERC20(USDC).transferFrom(msg.sender, address(this), amount);
+        _creditUSDC(msg.sender, amount);
+        emit TokenDeposited(msg.sender, USDC, amount);
+    } else {
+        IERC20(token).transferFrom(msg.sender, address(this), amount);
+        uint256 usdcReceived = _swapToUSDC(token, amount);
+
+        uint256 newTotalUSD = vaultsByToken[msg.sender][USDC] + usdcReceived;
+        if (newTotalUSD > bankCapUSD) revert BankCapExceeded(newTotalUSD);
+
+        _creditUSDC(msg.sender, usdcReceived);
+        emit TokenDeposited(msg.sender, USDC, usdcReceived);
+    }
+}
+    
+
+    /*//////////////////////////////////////////////////////////////
+                             View Functions
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Returns sender's ETH vault balance
+    /// @return balance Available balance in wei
+    function getMyVaultBalance() external view returns (uint256) {
+        return vaults[msg.sender];
+    }
+
+    /// @notice Returns ETH vault balance of a given address
+    /// @param user Address to query
+    /// @return balance Available balance in wei
+    function getVaultBalanceOf(address user) external view returns (uint256) {
+        return vaults[user];
+    }
+
+    /// @notice Returns ERC-20 token vault balance for a user
+    /// @param user User address
+    /// @param token ERC-20 token address
+    /// @return balance Available balance in token units
+    function getVaultBalanceOfToken(address user, address token) external view returns (uint256) {
+        return vaultsByToken[user][token];
+    }
+
+    /// @notice Gets current ETH price in USD from Chainlink
+    /// @return ethPrice ETH price in USD with 8 decimals
+    function getLatestETHPrice() public view returns (uint256 ethPrice) {
+        (, int256 price,,,) = priceFeed.latestRoundData();
+        if (price <= 0) revert InvalidPrice(); 
+        return uint256(price); 
+    }
+
+    /// @notice Converts ETH amount (wei) to USD (6 decimals)
+    /// @param ethAmountWei Amount in wei
+    /// @return usdAmount Equivalent amount in USD
+    function convertETHtoUSD(uint256 ethAmountWei) public view returns (uint256 usdAmount) {
+        uint256 ethPrice = getLatestETHPrice(); 
+        uint256 ethAmountUSD = (ethAmountWei * ethPrice) / 1e18; 
+        return ethAmountUSD / 1e2; v
+    }
+
+    /// @notice Converts ERC-20 token amount to USD (6 decimals)
+    /// @param token ERC-20 token address
+    /// @param amount Amount in token units
+    /// @return usdAmount Equivalent amount in USD
+    function convertTokenToUSD(address token, uint256 amount) public view returns (uint256 usdAmount) {
+        if (token == NATIVE_TOKEN) {
+            return convertETHtoUSD(amount);
+        }
+
+        uint8 tokenDecimals = tokenDecimalsCache[token];
+        if (tokenDecimals == 0) {
+            try IERC20Metadata(token).decimals() returns (uint8 dec) {
+                tokenDecimals = dec;
+            } catch {
+                revert UnsupportedDecimals();
+            }
+        }
+
+        if (tokenDecimals > 18) revert UnsupportedDecimals();
+
+        uint256 scaled = amount * (10 ** (18 - tokenDecimals));
+        return scaled / 1e12; 
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            Internal Functions
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Handles ETH deposit logic
+    /// @param sender Depositor address
+    /// @param amount Amount deposited in wei
+    function _handleDeposit(address sender, uint256 amount) internal {
+        unchecked {
+            vaults[sender] += amount;
+            totalDeposited += amount;
+        }
+        depositCount[sender] += 1;
+        emit Deposited(sender, amount);
+    }
+
+    /// @notice Handles ETH deposit logic
+    /// @param sender Depositor address
+    /// @param amount Amount deposited in wei
+    function _safeTransfer(address to, uint256 amount) private {
+        (bool ok, ) = to.call{value: amount}("");
+        if (!ok) revert NativeTransferFailed(to, amount);
+    }
+
+    /// @notice Credits USDC to user's vault
+    /// @param user User address
+    /// @param amount Amount in USDC to credit
+    function _creditUSDC(address user, uint256 amount) internal {   
+    vaultsByToken[user][USDC] += amount;
+    totalDepositedByToken[USDC] += amount;
+    depositCountByToken[user][USDC] += 1;
+}
+    /// @notice Swaps ERC-20 token to USDC via Uniswap V2
+    /// @param token Token to swap
+    /// @param amount Amount to swap
+    /// @return usdcReceived Amount of USDC received from swap
+function _swapToUSDC(address token, uint256 amount) internal returns (uint256 usdcReceived) { 
+    if (token == USDC) revert("Token ya es USDC");
+
+    address pair = uniswapFactory.getPair(token, USDC);
+    if (pair == address(0)) revert NoUSDCTradingPair(token);
+
+    IERC20(token).approve(address(uniswapRouter), amount);
+
+    address[] memory path = new address[](2);
+    path[0] = token;
+    path[1] = USDC;
+
+    uint[] memory amounts = uniswapRouter.swapExactTokensForTokens(
+        amount,
+        0,
+        path,
+        address(this),
+        block.timestamp
+    );
+
+    return amounts[1];
+}
+
+
+    /*//////////////////////////////////////////////////////////////
+                          RECEIVE / FALLBACK
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Accepts direct ETH and treats it as deposit()
+    receive()
+        external
+        payable
+        nonZeroDeposit
+        nonReentrant
+        validDepositCapUSD(msg.value)
+    {
+        _handleDeposit(msg.sender, msg.value);
+    }
+
+    /// @notice Fallback: accepts data and ETH, behaves like deposit() if ETH is sent
+    fallback()
+        external
+        payable
+        nonZeroDeposit
+        nonReentrant
+        validDepositCapUSD(msg.value)
+    {
+        _handleDeposit(msg.sender, msg.value);
+    }
+}
