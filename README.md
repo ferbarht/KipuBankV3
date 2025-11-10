@@ -19,16 +19,34 @@ KipuBankV3 es un contrato inteligente de bóveda personal multimoneda con contro
 - Uniswap V2: Para swap de tokens no-USDC a USDC
 
    Despliegue
+
+##  Despliegue
+
+Para desplegar el contrato `KipuBankV3` en Remix conectado a MetaMask (por ejemplo en Sepolia), seguí estos pasos:
+
+Parámetros del constructor
+
+Al desplegar el contrato, completá los siguientes parámetros:
+
+```solidity
 constructor(
     uint256 _withdrawalLimit,       // Límite de retiro por transacción (en wei)
     uint256 _bankCapUSD,            // Cap global en USD (6 decimales)
-    address _uniswapRouter,         // Dirección del router de Uniswap V2 0x2D99ABD9008Dc933ff5c0CD271B88309593aB921
-    address _uniswapFactory         // Dirección de la factory de Uniswap V2 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f
-) payable
+    address _uniswapRouter,         // Dirección del router de Uniswap V2
+    address _uniswapFactory         // Dirección de la factory de Uniswap V2
+)
 
 Si se envía ETH al constructor, se deposita automáticamente en la bóveda del deployer.
 
- Funciones principales
+Ejemplo:
+
+withdrawalLimit = 500000000000000000
+bankCapUSD = 2000000000000000000
+uniswapRouter = 0x2D99ABD9008Dc933ff5c0CD271B88309593aB921
+uniswapFactory = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f
+```
+
+#Funciones principales
 Depósitos
 - deposit(): Deposita ETH
 - depositToken(address token, uint256 amount): Deposita tokens ERC-20
