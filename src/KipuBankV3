@@ -8,7 +8,7 @@ import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 import "@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol";
 
-/// @title KipuBankV2 - Personal multi-token vault with access control and USD cap via Chainlink
+/// @title KipuBankV3 - Personal multi-token vault with access control and USD cap via Chainlink
 /// @author Fernando
 /// @notice Deposit and withdraw ETH or ERC-20 tokens into personal vaults, with admin roles and USD cap
 /// @dev Uses AccessControl, supports multiple tokens, integrates Chainlink oracle, optimizes gas via decimal cache
